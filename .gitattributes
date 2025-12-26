@@ -1,0 +1,23 @@
+# Force LF line endings for all files
+* text=auto eol=lf
+
+# Ensure Go files use LF
+*.go text eol=lf
+
+# Ensure shell scripts use LF
+*.sh text eol=lf
+
+# Ensure markdown uses LF
+*.md text eol=lf
+
+# Ensure config files use LF
+*.json text eol=lf
+*.yaml text eol=lf
+*.yml text eol=lf
+*.toml text eol=lf
+
+# Binary files
+*.exe binary
+*.dll binary
+*.so binary
+*.dylib binary
