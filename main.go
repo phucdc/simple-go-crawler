@@ -2,6 +2,7 @@ package main
 
 import (
 	"crypto/tls"
+	"encoding/json"
 	"flag"
 	"fmt"
 	"net/http"
@@ -26,6 +27,13 @@ type Config struct {
 	Verbose     bool
 }
 
+type FormOutput struct {
+	URL        string   `json:"url"`
+	Parameters []string `json:"parameters"`
+	BodyParams []string `json:"body_params"`
+	Method     string   `json:"method"`
+}
+
 type Form struct {
 	Action  string      `json:"action"`
 	Method  string      `json:"method"`
@@ -41,9 +49,8 @@ type FormInput struct {
 }
 
 type CrawlResult struct {
-	URLs  map[string]bool
-	Forms []Form
-	mu    sync.Mutex
+	seenForms map[string]bool
+	mu        sync.Mutex
 }
 
 type Crawler struct {
@@ -77,8 +84,6 @@ func main() {
 	}
 
 	crawler.Crawl(config.StartURL, 0)
-
-	printResults(crawler.result)
 }
 
 func parseFlags() Config {
@@ -161,8 +166,7 @@ func NewCrawler(config Config) (*Crawler, error) {
 		client:  client,
 		baseURL: baseURL,
 		result: &CrawlResult{
-			URLs:  make(map[string]bool),
-			Forms: []Form{},
+			seenForms: make(map[string]bool),
 		},
 		visited:    make(map[string]bool),
 		dontAccess: dontAccessPatterns,
@@ -274,19 +278,16 @@ func (c *Crawler) Crawl(targetURL string, depth int) {
 			return
 		}
 
-		c.result.mu.Lock()
-		if !c.result.URLs[absoluteURL] {
-			c.result.URLs[absoluteURL] = true
+		c.visitedMu.Lock()
+		if !c.visited[absoluteURL] {
 			newURLs = append(newURLs, absoluteURL)
 		}
-		c.result.mu.Unlock()
+		c.visitedMu.Unlock()
 	})
 
 	doc.Find("form").Each(func(i int, s *goquery.Selection) {
 		form := c.extractForm(s, targetURL)
-		c.result.mu.Lock()
-		c.result.Forms = append(c.result.Forms, form)
-		c.result.mu.Unlock()
+		c.printFormIfNew(form)
 	})
 
 	for _, newURL := range newURLs {
@@ -334,7 +335,13 @@ func (c *Crawler) extractForm(s *goquery.Selection, pageURL string) Form {
 	if action == "" {
 		action = pageURL
 	} else {
-		action = c.resolveURL(pageURL, action)
+		resolved := c.resolveURL(pageURL, action)
+		// If resolveURL returns empty (e.g., for "#" or "javascript:"), use pageURL
+		if resolved == "" {
+			action = pageURL
+		} else {
+			action = resolved
+		}
 	}
 
 	var inputs []FormInput
@@ -365,12 +372,15 @@ func (c *Crawler) extractForm(s *goquery.Selection, pageURL string) Form {
 			inputType = "text"
 		}
 
-		inputs = append(inputs, FormInput{
-			Name:     name,
-			Type:     inputType,
-			Value:    value,
-			Required: required,
-		})
+		// Only add inputs that have a name attribute
+		if name != "" {
+			inputs = append(inputs, FormInput{
+				Name:     name,
+				Type:     inputType,
+				Value:    value,
+				Required: required,
+			})
+		}
 	})
 
 	return Form{
@@ -381,67 +391,70 @@ func (c *Crawler) extractForm(s *goquery.Selection, pageURL string) Form {
 	}
 }
 
-func printResults(result *CrawlResult) {
-	fmt.Println("\n" + strings.Repeat("=", 80))
-	fmt.Println("CRAWL RESULTS")
-	fmt.Println(strings.Repeat("=", 80))
+func (c *Crawler) printFormIfNew(form Form) {
+	if form.Action == "" {
+		return
+	}
 
-	// Deduplicate URLs by Method+URL
-	seenURLs := make(map[string]bool)
-	var uniqueURLs []string
-	for urlStr := range result.URLs {
-		key := "GET|" + urlStr
-		if !seenURLs[key] {
-			seenURLs[key] = true
-			uniqueURLs = append(uniqueURLs, urlStr)
+	// Parse the action URL to extract query parameters
+	parsedURL, err := url.Parse(form.Action)
+	if err != nil {
+		return
+	}
+
+	// Get base URL without query string for deduplication key
+	baseAction := parsedURL.Scheme + "://" + parsedURL.Host + parsedURL.Path
+	key := form.Method + "|" + baseAction
+
+	c.result.mu.Lock()
+	if c.result.seenForms[key] {
+		c.result.mu.Unlock()
+		return
+	}
+	c.result.seenForms[key] = true
+	c.result.mu.Unlock()
+
+	// Extract query parameters from URL
+	var urlParams []string
+	for param := range parsedURL.Query() {
+		urlParams = append(urlParams, param)
+	}
+
+	// Extract form input parameters
+	var formParams []string
+	for _, input := range form.Inputs {
+		if input.Name != "" {
+			formParams = append(formParams, input.Name)
 		}
 	}
 
-	fmt.Printf("\n[URLs Found: %d]\n", len(uniqueURLs))
-	fmt.Println(strings.Repeat("-", 40))
-	fmt.Println("Method,URL,Params")
-	for _, urlStr := range uniqueURLs {
-		fmt.Printf("GET,%s,\n", urlStr)
+	output := &FormOutput{
+		URL:        baseAction,
+		Method:     form.Method,
+		Parameters: []string{},
+		BodyParams: []string{},
 	}
 
-	// Deduplicate forms by Method+URL, merge params
-	formMap := make(map[string][]string)
-	formOrder := []string{}
-	for _, form := range result.Forms {
-		key := form.Method + "|" + form.Action
-		var params []string
-		for _, input := range form.Inputs {
-			if input.Name != "" {
-				params = append(params, input.Name)
-			}
+	// URL query params always go to Parameters
+	if len(urlParams) > 0 {
+		output.Parameters = append(output.Parameters, urlParams...)
+	}
+
+	// Form input params go to Parameters (GET) or BodyParams (POST)
+	if form.Method == "GET" {
+		if len(formParams) > 0 {
+			output.Parameters = append(output.Parameters, formParams...)
 		}
-		if _, exists := formMap[key]; !exists {
-			formOrder = append(formOrder, key)
-			formMap[key] = params
-		} else {
-			// Merge params if new ones found
-			existingParams := make(map[string]bool)
-			for _, p := range formMap[key] {
-				existingParams[p] = true
-			}
-			for _, p := range params {
-				if !existingParams[p] {
-					formMap[key] = append(formMap[key], p)
-				}
-			}
+	} else {
+		if len(formParams) > 0 {
+			output.BodyParams = formParams
 		}
 	}
 
-	fmt.Printf("\n[Forms Found: %d]\n", len(formMap))
-	fmt.Println(strings.Repeat("-", 40))
-	fmt.Println("Method,URL,Params")
-	for _, key := range formOrder {
-		parts := strings.SplitN(key, "|", 2)
-		method := parts[0]
-		action := parts[1]
-		params := formMap[key]
-		fmt.Printf("%s,%s,%s\n", method, action, strings.Join(params, "&"))
+	jsonBytes, err := json.Marshal(output)
+	if err != nil {
+		return
 	}
-
-	fmt.Println("\n" + strings.Repeat("=", 80))
+	jsonStr := strings.ReplaceAll(string(jsonBytes), "\\u0026", "&")
+	fmt.Println(jsonStr)
 }
